@@ -28,7 +28,7 @@ import memory
 import profile as profile_module
 import search
 from categorizer import categorize_message
-from debate import run_debate
+from debate import run_debate, generate_clarification_questions, map_answers_to_context
 from utils import escape_md2, safe_send
 
 load_dotenv()
@@ -220,28 +220,121 @@ async def reflect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
-# Message handler — triggers debate
+# Skip phrases — user wants to bypass clarification
+# ---------------------------------------------------------------------------
+
+SKIP_PHRASES = {"skip", "דלג", "התחל", "start", "go", "בלי שאלות", "תמשיך"}
+
+
+def _is_skip(text: str) -> bool:
+    return text.strip().lower() in SKIP_PHRASES
+
+
+# ---------------------------------------------------------------------------
+# Core: run debate and send vote keyboard
+# ---------------------------------------------------------------------------
+
+async def _run_debate_and_vote(
+    chat_id: int,
+    user_id: str,
+    question: str,
+    category: str,
+    complexity: str,
+    tools: list[str],
+    search_results: list,
+    selected_agents: list,
+    clarification_questions: list | None,
+    clarification_answers: str | None,
+    clarification_context: str | None,
+    bot,
+) -> None:
+    """Execute debate, save session, send vote keyboard."""
+
+    async def send_fn(msg: str):
+        await safe_send(bot, chat_id, msg)
+
+    await bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    result = await run_debate(
+        client=anthropic_client,
+        question=question,
+        category=category,
+        complexity=complexity,
+        search_results=search_results,
+        agents=selected_agents,
+        send_fn=send_fn,
+        clarification_context=clarification_context,
+    )
+
+    # Save session
+    try:
+        session_id = await memory.save_session(
+            user_id=user_id,
+            topic=question[:500],
+            category=category,
+            complexity=complexity,
+            debate_rounds={"rounds": result.rounds, "summary": result.summary},
+            clarification_questions=clarification_questions,
+            clarification_answers=clarification_answers,
+        )
+    except Exception as e:
+        logger.error(f"Failed to save session: {e}")
+        session_id = None
+
+    # Update state to VOTING
+    active_sessions[chat_id] = {
+        "status": "VOTING",
+        "session_id": session_id,
+        "category": category,
+        "tools": tools,
+        "selected_agents": selected_agents,
+        "result": {
+            "question": result.question,
+            "category": result.category,
+            "complexity": result.complexity,
+            "participating_agents": result.participating_agents,
+        },
+    }
+
+    # Vote keyboard
+    keyboard = [
+        [InlineKeyboardButton(f"{a.emoji} {a.name}", callback_data=f"vote_{a.id}")]
+        for a in selected_agents
+    ]
+    keyboard.append([InlineKeyboardButton("🚫 בלי הצבעה", callback_data="vote_none")])
+    await bot.send_message(
+        chat_id=chat_id,
+        text="🗳️ איזה יועץ הכי דיבר אליך?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Message handler — triggers clarification OR debate
 # ---------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any non-command text message — start a debate."""
+    """Handle any non-command text message."""
     chat_id = update.effective_chat.id
     user_id = str(chat_id)
-    text = update.message.text
+    text = (update.message.text or "").strip()
 
-    if not text or not text.strip():
+    if not text:
         return
 
-    # Guard: don't start new debate while one is running
     existing = active_sessions.get(chat_id)
-    if existing and existing.get("status") == "DEBATING":
-        await safe_send(
-            context.bot, chat_id,
-            escape_md2("⏳ דיון כבר רץ. חכה שיסתיים או שלח /new.")
-        )
+
+    # --- Route to clarification reply handler ---
+    if existing and existing.get("status") == "CLARIFYING":
+        await _handle_clarification_reply(chat_id, user_id, text, context)
         return
 
-    # Mark as debating
+    # --- Block during active debate ---
+    if existing and existing.get("status") == "DEBATING":
+        await safe_send(context.bot, chat_id, escape_md2("⏳ דיון כבר רץ. חכה שיסתיים או שלח /new."))
+        return
+
+    # --- New question flow ---
     active_sessions[chat_id] = {"status": "DEBATING"}
 
     try:
@@ -251,78 +344,112 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         complexity = classification["complexity"]
         tools = classification["tools_mentioned"]
 
-        # 2. Search (don't block on failure)
+        # 2. Search
         search_results = await search.search_context(text)
 
         # 3. Select agents
         selected_agents = agents_module.select_agents(category, complexity)
 
-        # 4. Send callback
-        async def send_fn(msg: str):
-            await safe_send(context.bot, chat_id, msg)
-
-        # 5. Typing indicator
+        # 4. Phase 0 — Clarification check
+        await safe_send(context.bot, chat_id, escape_md2("🔍 המועצה בוחנת את השאלה לפני שמתחילים..."))
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        # 6. Run debate
-        result = await run_debate(
-            client=anthropic_client,
-            question=text,
-            category=category,
-            complexity=complexity,
-            search_results=search_results,
-            agents=selected_agents,
-            send_fn=send_fn,
-        )
+        from search import format_search_context
+        search_str = format_search_context(search_results)
+        questions = await generate_clarification_questions(anthropic_client, text, search_str)
 
-        # 7. Save session
-        try:
-            session_id = await memory.save_session(
-                user_id=user_id,
-                topic=text[:500],
-                category=category,
-                complexity=complexity,
-                debate_rounds={"rounds": result.rounds, "summary": result.summary},
+        if not questions:
+            # Enough detail — go straight to debate
+            await safe_send(context.bot, chat_id, escape_md2("✅ פירטת מספיק — מכנס את המועצה עכשיו..."))
+            await _run_debate_and_vote(
+                chat_id=chat_id, user_id=user_id, question=text,
+                category=category, complexity=complexity, tools=tools,
+                search_results=search_results, selected_agents=selected_agents,
+                clarification_questions=None, clarification_answers=None,
+                clarification_context=None, bot=context.bot,
             )
-        except Exception as e:
-            logger.error(f"Failed to save session: {e}")
-            session_id = None
+        else:
+            # Store state and ask questions
+            active_sessions[chat_id] = {
+                "status": "CLARIFYING",
+                "question": text,
+                "category": category,
+                "complexity": complexity,
+                "tools": tools,
+                "search_results": search_results,
+                "selected_agents": selected_agents,
+                "clarification_questions": questions,
+            }
+            await _send_clarification_questions(chat_id, questions, context.bot)
 
-        # 8. Update active session state
-        active_sessions[chat_id] = {
-            "status": "VOTING",
-            "session_id": session_id,
-            "category": category,
-            "tools": tools,
-            "result": {
-                "question": result.question,
-                "category": result.category,
-                "complexity": result.complexity,
-                "participating_agents": result.participating_agents,
-            },
-        }
+    except Exception as e:
+        logger.error(f"Message handling failed: {e}", exc_info=True)
+        active_sessions.pop(chat_id, None)
+        await safe_send(context.bot, chat_id, escape_md2("❌ שגיאה. נסה שוב."))
 
-        # 9. Vote keyboard
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{a.emoji} {a.name}",
-                callback_data=f"vote_{a.id}"
-            )]
-            for a in selected_agents
-        ]
-        keyboard.append([InlineKeyboardButton("🚫 בלי הצבעה", callback_data="vote_none")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🗳️ איזה יועץ הכי דיבר אליך?",
-            reply_markup=reply_markup,
+async def _send_clarification_questions(chat_id: int, questions: list[dict], bot) -> None:
+    """Format and send clarification questions to the user."""
+    lines = ["לפני שהמועצה מתחילה, יש כמה שאלות:\n"]
+    for q in questions:
+        asked_by = q.get("asked_by", "יועץ")
+        question = q.get("question", "")
+        why = q.get("why_it_matters", "")
+        lines.append(f"{asked_by} שואל:\n{question}")
+        if why:
+            lines.append(f"_({why})_\n")
+    lines.append("\nענה על הכל בהודעה אחת. או שלח 'דלג' כדי להתחיל בלי הבהרות.")
+    await safe_send(bot, chat_id, escape_md2("\n".join(lines)))
+
+
+async def _handle_clarification_reply(
+    chat_id: int, user_id: str, text: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Process user's clarification answers, then launch debate."""
+    session = active_sessions.get(chat_id)
+    if not session:
+        return
+
+    original_question = session["question"]
+    category = session["category"]
+    complexity = session["complexity"]
+    tools = session["tools"]
+    search_results = session["search_results"]
+    selected_agents = session["selected_agents"]
+    questions = session["clarification_questions"]
+
+    # Mark as debating to block re-entry
+    active_sessions[chat_id] = {"status": "DEBATING"}
+
+    try:
+        if _is_skip(text):
+            # User skipped — no clarification context
+            await safe_send(context.bot, chat_id, escape_md2("⏭️ דולג — מכנס את המועצה..."))
+            clarification_context = None
+            clarification_answers = None
+        else:
+            # Map answers → context summary
+            await safe_send(context.bot, chat_id, escape_md2("✅ תודה — מסכם את הפרטים ומכנס את המועצה..."))
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            clarification_context = await map_answers_to_context(
+                anthropic_client, original_question, questions, text
+            )
+            clarification_answers = text
+
+        await _run_debate_and_vote(
+            chat_id=chat_id, user_id=user_id, question=original_question,
+            category=category, complexity=complexity, tools=tools,
+            search_results=search_results, selected_agents=selected_agents,
+            clarification_questions=questions,
+            clarification_answers=clarification_answers,
+            clarification_context=clarification_context,
+            bot=context.bot,
         )
 
     except Exception as e:
-        logger.error(f"Debate failed: {e}", exc_info=True)
+        logger.error(f"Clarification reply failed: {e}", exc_info=True)
         active_sessions.pop(chat_id, None)
-        await safe_send(context.bot, chat_id, escape_md2("❌ שגיאה בהפעלת הדיון. נסה שוב."))
+        await safe_send(context.bot, chat_id, escape_md2("❌ שגיאה. נסה שוב."))
 
 
 # ---------------------------------------------------------------------------

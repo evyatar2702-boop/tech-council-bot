@@ -12,8 +12,14 @@ CREATE TABLE tech_sessions (
     debate_rounds JSONB,
     voted_agent TEXT,
     implementation_started BOOLEAN DEFAULT FALSE,
-    outcome_note TEXT
+    outcome_note TEXT,
+    clarification_questions JSONB,
+    clarification_answers TEXT
 );
+
+-- If table already exists, run these instead:
+-- ALTER TABLE tech_sessions ADD COLUMN IF NOT EXISTS clarification_questions JSONB;
+-- ALTER TABLE tech_sessions ADD COLUMN IF NOT EXISTS clarification_answers TEXT;
 
 CREATE TABLE tech_decisions (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -65,6 +71,8 @@ async def save_session(
     category: str,
     complexity: str,
     debate_rounds: dict,
+    clarification_questions: list | None = None,
+    clarification_answers: str | None = None,
 ) -> str:
     """Insert a new tech_session. Returns the session UUID."""
     data = {
@@ -74,6 +82,10 @@ async def save_session(
         "complexity": complexity,
         "debate_rounds": debate_rounds,
     }
+    if clarification_questions:
+        data["clarification_questions"] = clarification_questions
+    if clarification_answers:
+        data["clarification_answers"] = clarification_answers
 
     def _insert():
         return _get_client().table("tech_sessions").insert(data).execute()
