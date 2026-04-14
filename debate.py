@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Concurrency limiter — avoid rate limits on Anthropic API
 _semaphore = asyncio.Semaphore(5)
 
-MODEL = "claude-sonnet-4-5-20250514"
+MODEL = "claude-sonnet-4-6"
 
 # Token limits per complexity and round
 TOKEN_LIMITS = {
